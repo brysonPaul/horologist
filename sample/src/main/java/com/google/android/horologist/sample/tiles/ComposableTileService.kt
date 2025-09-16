@@ -16,14 +16,13 @@
 
 package com.google.android.horologist.sample.tiles
 
-import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.material3.FilledIconButton
@@ -48,46 +47,35 @@ class ComposableTileService : SuspendingTileService() {
     override fun onCreate() {
         super.onCreate()
 
-        renderer = ServiceComposableBitmapRenderer(this.application)
+        renderer = ServiceComposableBitmapRenderer(this.application, this)
     }
 
     /** This method returns a Tile object, which describes the layout of the Tile. */
     override suspend fun tileRequest(requestParams: TileRequest): Tile {
-        val layoutElement = LayoutElementBuilders.Box.Builder()
-            .setWidth(expand())
-            .setHeight(expand())
-            .addContent(
-                LayoutElementBuilders.Image.Builder()
-                    .setWidth(dp(100f))
-                    .setHeight(dp(100f))
-                    .setResourceId(ComposeId)
-                    .build(),
-            )
-            .build()
+        val layoutElement =
+            LayoutElementBuilders.Box.Builder().setWidth(expand()).setHeight(expand()).addContent(
+                LayoutElementBuilders.Image.Builder().setWidth(dp(100f)).setHeight(dp(100f))
+                    .setResourceId(ComposeId).build(),
+            ).build()
 
-        return Tile.Builder()
-            .setResourcesVersion(UUID.randomUUID().toString())
-            .setTileTimeline(Timeline.fromLayoutElement(layoutElement))
-            .build()
+        return Tile.Builder().setResourcesVersion(UUID.randomUUID().toString())
+            .setTileTimeline(Timeline.fromLayoutElement(layoutElement)).build()
     }
 
     override suspend fun resourcesRequest(requestParams: ResourcesRequest): Resources {
         // Add images to the Resources object, and return
         val circleComposeBitmap = circleCompose()
-        return Resources.Builder()
-            .setVersion(requestParams.version)
-            .apply {
-                if (circleComposeBitmap != null) {
-                    addIdToImageMapping(
-                        ComposeId,
-                        circleComposeBitmap.copy(Bitmap.Config.ARGB_8888, false).toImageResource(),
-                    )
-                }
+        return Resources.Builder().setVersion(requestParams.version).apply {
+            if (circleComposeBitmap != null) {
+                addIdToImageMapping(
+                    ComposeId,
+                    circleComposeBitmap.toImageResource(),
+                )
             }
-            .build()
+        }.build()
     }
 
-    private suspend fun circleCompose(): Bitmap? =
+    private suspend fun circleCompose(): ImageBitmap? =
         renderer.renderComposableToBitmap(DpSize(100.dp, 100.dp)) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
@@ -97,5 +85,5 @@ class ComposableTileService : SuspendingTileService() {
                     Text("\uD83D\uDC6A")
                 }
             }
-        }?.asAndroidBitmap()
+        }
 }

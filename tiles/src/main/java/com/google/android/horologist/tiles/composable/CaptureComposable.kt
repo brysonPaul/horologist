@@ -19,7 +19,7 @@ package com.google.android.horologist.tiles.composable
 import android.app.Application
 import android.app.Dialog
 import android.app.Presentation
-import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
 import android.view.Display
@@ -32,6 +32,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.ImageBitmapConfig
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.Density
@@ -49,8 +52,10 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * A renderer that renders a composable to a bitmap.
@@ -59,6 +64,7 @@ public interface ComposableBitmapRenderer {
 
     public suspend fun renderComposableToBitmap(
         canvasSize: DpSize,
+        config: ImageBitmapConfig? = ImageBitmapConfig.Rgb565,
         composableContent: @Composable () -> Unit,
     ): ImageBitmap?
 }
@@ -70,46 +76,22 @@ public interface ComposableBitmapRenderer {
  * Rebecca Frank's implementation https://gist.github.com/riggaroo/0e0072b3e85aa91443659031925fa47c
  *
  * Original source: https://gist.github.com/iamcalledrob/871568679ad58e64959b097d4ef30738
- * Adapted to use new GraphicsLayer commands (record and toBitmap())
- *     Usage example:
- *     val offscreenBitmapManager = OffscreenBitmapManager(context)
- *     val bitmap = offscreenBitmapManager.renderComposableToBitmap {
- *              ImageResult() // etc
- *              }
  */
-public class ServiceComposableBitmapRenderer(private val application: Application) :
+public class ServiceComposableBitmapRenderer(
+    private val application: Application,
+    private val lifecycleOwner: LifecycleOwner = ProcessLifecycleOwner.get(),
+) :
     ComposableBitmapRenderer {
-
-        private suspend fun <T> useVirtualDisplay(callback: suspend (display: Display) -> T): T? {
-            val texture = SurfaceTexture(false)
-            val surface = Surface(texture)
-            val virtualDisplay =
-                application.getSystemService(DisplayManager::class.java).createVirtualDisplay(
-                    "virtualDisplay",
-                    1,
-                    1,
-                    72,
-                    surface,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
-                ) ?: return null
-
-            val result = callback(virtualDisplay!!.display)
-            virtualDisplay.release()
-            surface.release()
-            texture.release()
-            return result
-        }
 
         override suspend fun renderComposableToBitmap(
             canvasSize: DpSize,
+            config: ImageBitmapConfig?,
             composableContent: @Composable () -> Unit,
         ): ImageBitmap? {
             val bitmap = useVirtualDisplay { display ->
-                val density = Density(application)
-
                 val presentation = Presentation(application, display).apply {
                     window?.decorView?.let { view ->
-                        view.setViewTreeLifecycleOwner(ProcessLifecycleOwner.get())
+                        view.setViewTreeLifecycleOwner(lifecycleOwner)
                         view.setViewTreeSavedStateRegistryOwner(EmptySavedStateRegistryOwner())
                     }
                 }
@@ -117,9 +99,7 @@ public class ServiceComposableBitmapRenderer(private val application: Applicatio
                 coroutineScope {
                     try {
                         val result = captureComposable(
-                            context = application,
                             size = canvasSize,
-                            density = density,
                             presentation = presentation,
                             coroutineScope = this,
                         ) {
@@ -132,18 +112,49 @@ public class ServiceComposableBitmapRenderer(private val application: Applicatio
                     }
                 }
             }
-            return bitmap
+            return if (config != null && bitmap != null) {
+                bitmap.convert(config)
+            } else {
+                bitmap
+            }
         }
 
         private fun Size.roundedToIntSize(): IntSize =
             IntSize(width.toInt(), height.toInt())
 
-        private class EmptySavedStateRegistryOwner : SavedStateRegistryOwner {
+        private suspend fun <T> useVirtualDisplay(callback: suspend (display: Display) -> T): T? {
+            val texture = SurfaceTexture(false)
+            val surface = Surface(texture)
+
+            try {
+                val outerContext = application.resources.displayMetrics
+                val virtualDisplay =
+                    application.getSystemService(DisplayManager::class.java).createVirtualDisplay(
+                        "virtualDisplay",
+                        outerContext.widthPixels,
+                        outerContext.heightPixels,
+                        outerContext.densityDpi,
+                        surface,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
+                    ) ?: return null
+
+                try {
+                    return withContext(Dispatchers.Main.immediate) { callback(virtualDisplay.display) }
+                } finally {
+                    virtualDisplay.release()
+                }
+            } finally {
+                surface.release()
+                texture.release()
+            }
+        }
+
+        private inner class EmptySavedStateRegistryOwner : SavedStateRegistryOwner {
             private val controller = SavedStateRegistryController.create(this).apply {
                 performRestore(null)
             }
 
-            private val lifecycleOwner: LifecycleOwner = ProcessLifecycleOwner.get()
+            private val lifecycleOwner: LifecycleOwner = this@ServiceComposableBitmapRenderer.lifecycleOwner
 
             override val lifecycle: Lifecycle
                 get() =
@@ -170,14 +181,14 @@ public class ServiceComposableBitmapRenderer(private val application: Applicatio
          *  Be sure to invoke capture() within the composable content (e.g. in a LaunchedEffect) to perform the capture.
          *  This gives some level of control over when the capture occurs, so it's possible to wait for async resources */
         private fun captureComposable(
-            context: Context,
             size: DpSize,
-            density: Density = Density(density = 1f),
             presentation: Dialog,
             coroutineScope: CoroutineScope,
             content: @Composable () -> Unit,
         ): Deferred<ImageBitmap> {
-            val composeView = ComposeView(context).apply {
+            val density = Density(presentation.context)
+
+            val composeView = ComposeView(presentation.context).apply {
                 val intSize = with(density) { size.toSize().roundedToIntSize() }
                 require(intSize.width > 0 && intSize.height > 0) { "pixel size must not have zero dimension" }
 
@@ -224,3 +235,23 @@ public class ServiceComposableBitmapRenderer(private val application: Applicatio
             }
         }
     }
+
+internal fun ImageBitmapConfig.toBitmapConfig(): Bitmap.Config {
+    return if (this == ImageBitmapConfig.Argb8888) {
+        Bitmap.Config.ARGB_8888
+    } else if (this == ImageBitmapConfig.Alpha8) {
+        Bitmap.Config.ALPHA_8
+    } else if (this == ImageBitmapConfig.Rgb565) {
+        Bitmap.Config.RGB_565
+    } else if (this == ImageBitmapConfig.F16) {
+        Bitmap.Config.RGBA_F16
+    } else if (this == ImageBitmapConfig.Gpu) {
+        Bitmap.Config.HARDWARE
+    } else {
+        Bitmap.Config.ARGB_8888
+    }
+}
+
+internal fun ImageBitmap.convert(config: ImageBitmapConfig): ImageBitmap {
+    return this.asAndroidBitmap().copy(config.toBitmapConfig(), false).asImageBitmap()
+}
